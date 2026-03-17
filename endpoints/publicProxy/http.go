@@ -258,6 +258,24 @@ func handleInterstitial(w http.ResponseWriter, r *http.Request, pcfg *Config, cf
 func resolveService(hostMatch string, host string) string {
 	if hostMatch == "" || strings.Contains(host, hostMatch) {
 		tokens := strings.Split(host, ".")
+
+		// 检测是否包含IP地址模式
+		for i := 0; i < len(tokens); i++ {
+			// 尝试重组可能的IP地址
+			if len(tokens)-i >= 4 {
+				testIP := strings.Join(tokens[i:i+4], ".")
+				if net.ParseIP(testIP) != nil {
+					// IP地址在 i 位置开始，所以token是 i=0 的部分
+					if i > 0 {
+						return tokens[0]
+					}
+					// 如果IP地址在第一位，说明没有token（直接访问IP地址）
+					return ""
+				}
+			}
+		}
+
+		// 常规域名模式
 		if len(tokens) > 0 {
 			return tokens[0]
 		}

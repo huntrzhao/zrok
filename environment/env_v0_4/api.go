@@ -1,14 +1,18 @@
 package env_v0_4
 
 import (
+	"crypto/x509"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/go-openapi/runtime"
 	httptransport "github.com/go-openapi/runtime/client"
 	"github.com/go-openapi/strfmt"
+	"github.com/openziti/edge-api/rest_util"
 	"github.com/openziti/zrok/v2/build"
 	"github.com/openziti/zrok/v2/environment/env_core"
 	"github.com/openziti/zrok/v2/rest_client_zrok"
@@ -45,9 +49,63 @@ func (r *Root) Client() (*rest_client_zrok.Zrok, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "error parsing api endpoint '%v'", r)
 	}
+
+	// 检测是否是IP地址
+	isIPAddress := isIPAddressEndpoint(apiEndpoint)
+
 	transport := httptransport.New(apiUrl.Host, "/api/v2", []string{apiUrl.Scheme})
 	transport.Producers["application/zrok.v1+json"] = runtime.JSONProducer()
 	transport.Consumers["application/zrok.v1+json"] = runtime.JSONConsumer()
+
+	// 如果是IP地址，配置自定义TLS验证
+	if isIPAddress && apiUrl.Scheme == "https" {
+		// 获取服务器的CA证书（使用InsecureSkipVerify）
+		caCerts, err := rest_util.GetControllerWellKnownCas(apiEndpoint)
+		if err != nil {
+			return nil, errors.Wrapf(err, "error getting CA certs for api endpoint '%v': %v", apiEndpoint, err)
+		}
+		caPool := x509.NewCertPool()
+		for _, ca := range caCerts {
+			caPool.AddCert(ca)
+		}
+
+		// 创建自定义TLS配置
+		tlsConfig, err := rest_util.NewTlsConfig()
+		if err != nil {
+			return nil, errors.Wrap(err, "error creating TLS config")
+		}
+		tlsConfig.RootCAs = caPool
+		tlsConfig.InsecureSkipVerify = true // 先跳过默认验证
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			certs := make([]*x509.Certificate, len(rawCerts))
+			for i, rawCert := range rawCerts {
+				cert, err := x509.ParseCertificate(rawCert)
+				if err != nil {
+					return err
+				}
+				certs[i] = cert
+			}
+
+			// 验证证书链
+			opts := x509.VerifyOptions{
+				Roots:         caPool,
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, cert := range certs[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+
+			_, err := certs[0].Verify(opts)
+			return err
+		}
+
+		// 创建自定义HTTP客户端
+		httpClient, err := rest_util.NewHttpClientWithTlsConfig(tlsConfig)
+		if err != nil {
+			return nil, errors.Wrap(err, "error creating HTTP client with custom TLS config")
+		}
+		transport = httptransport.NewWithClient(apiUrl.Host, "/api/v2", []string{apiUrl.Scheme}, httpClient)
+	}
 
 	zrok := rest_client_zrok.New(transport, strfmt.Default)
 	_, err = zrok.Metadata.ClientVersionCheck(&metadata2.ClientVersionCheckParams{
@@ -59,6 +117,22 @@ func (r *Root) Client() (*rest_client_zrok.Zrok, error) {
 		return nil, errors.Wrapf(err, "client version error accessing api endpoint '%v': %v", apiEndpoint, err)
 	}
 	return zrok, nil
+}
+
+func isIPAddressEndpoint(apiEndpoint string) bool {
+	u, err := url.Parse(apiEndpoint)
+	if err != nil {
+		return false
+	}
+
+	// 提取主机名（去掉端口）
+	host := u.Host
+	if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
+		host = host[:colonIdx]
+	}
+
+	// 检查是否是IP地址格式
+	return net.ParseIP(host) != nil
 }
 
 func (r *Root) ApiEndpoint() (string, string) {

@@ -1,8 +1,12 @@
 package automation
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"net"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/openziti/edge-api/rest_management_api_client"
@@ -36,9 +40,26 @@ func NewZitiAutomation(cfg *Config) (*ZitiAutomation, error) {
 	for _, ca := range caCerts {
 		caPool.AddCert(ca)
 	}
-	edge, err := rest_util.NewEdgeManagementClientWithUpdb(cfg.Username, cfg.Password, cfg.ApiEndpoint, caPool)
+
+	// 检查是否是IP地址连接
+	isIPAddress, err := isIPAddressEndpoint(cfg.ApiEndpoint)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "error parsing API endpoint")
+	}
+
+	var edge *rest_management_api_client.ZitiEdgeManagement
+	if isIPAddress {
+		// 使用IP地址时，创建自定义TLS配置：验证CA但跳过主机名验证
+		edge, err = newEdgeManagementClientWithIPAddress(cfg.Username, cfg.Password, cfg.ApiEndpoint, caPool)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// 使用域名时，正常验证
+		edge, err = rest_util.NewEdgeManagementClientWithUpdb(cfg.Username, cfg.Password, cfg.ApiEndpoint, caPool)
+		if err != nil {
+			return nil, err
+		}
 	}
 	ziti := &ZitiAutomation{edge: edge}
 	ziti.Identities = NewIdentityManager(ziti)
@@ -49,6 +70,67 @@ func NewZitiAutomation(cfg *Config) (*ZitiAutomation, error) {
 	ziti.ServiceEdgeRouterPolicies = NewServiceEdgeRouterPolicyManager(ziti)
 	ziti.ServicePolicies = NewServicePolicyManager(ziti)
 	return ziti, nil
+}
+
+func isIPAddressEndpoint(apiEndpoint string) (bool, error) {
+	u, err := url.Parse(apiEndpoint)
+	if err != nil {
+		return false, err
+	}
+
+	// 提取主机名（去掉端口）
+	host := u.Host
+	if colonIdx := strings.Index(host, ":"); colonIdx != -1 {
+		host = host[:colonIdx]
+	}
+
+	// 检查是否是IP地址格式
+	return net.ParseIP(host) != nil, nil
+}
+
+func newEdgeManagementClientWithIPAddress(username, password string, apiAddress string, rootCas *x509.CertPool) (*rest_management_api_client.ZitiEdgeManagement, error) {
+	auth := rest_util.NewAuthenticatorUpdb(username, password)
+	auth.RootCas = rootCas
+
+	// 创建自定义TLS配置，验证CA但跳过主机名验证
+	auth.TlsConfigFunc = func() (*tls.Config, error) {
+		tlsConfig, err := rest_util.NewTlsConfig()
+		if err != nil {
+			return nil, err
+		}
+
+		// 保留原有的CA验证，但自定义验证逻辑
+		tlsConfig.RootCAs = rootCas
+
+		// 自定义验证函数：验证证书由受信任CA签发，但跳过主机名验证
+		tlsConfig.InsecureSkipVerify = true // 先跳过默认验证
+		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			certs := make([]*x509.Certificate, len(rawCerts))
+			for i, rawCert := range rawCerts {
+				cert, err := x509.ParseCertificate(rawCert)
+				if err != nil {
+					return err
+				}
+				certs[i] = cert
+			}
+
+			// 验证证书链
+			opts := x509.VerifyOptions{
+				Roots:         rootCas,
+				Intermediates: x509.NewCertPool(),
+			}
+			for _, cert := range certs[1:] {
+				opts.Intermediates.AddCert(cert)
+			}
+
+			_, err := certs[0].Verify(opts)
+			return err
+		}
+
+		return tlsConfig, nil
+	}
+
+	return rest_util.NewEdgeManagementClientWithAuthenticator(auth, apiAddress)
 }
 
 func (za *ZitiAutomation) Edge() *rest_management_api_client.ZitiEdgeManagement {
